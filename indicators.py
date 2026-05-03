@@ -1,16 +1,18 @@
 """
 종목/ETF 기술 지표 계산 모듈
-- 네이버 일별시세에서 (날짜, 종가, 거래량)을 받아온 뒤,
+- 네이버 JSON API로 5~10년치 일봉 OHLCV를 한 번에 받아온 뒤,
   일봉/주봉/월봉으로 리샘플링하고 RSI(14) / OBV trend / 지지·저항 계산.
 """
 
 from __future__ import annotations
 
+import datetime
+import json
+import re
 from typing import Any, Literal
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 
 HEADERS = {
     "User-Agent": (
@@ -19,54 +21,65 @@ HEADERS = {
     )
 }
 
-DAILY_URL = "https://finance.naver.com/item/sise_day.naver?code={code}&page={page}"
+# 네이버 JSON 시세 API (한 번에 수년치 받아옴)
+SISE_JSON_URL = (
+    "https://api.finance.naver.com/siseJson.naver"
+    "?symbol={code}&requestType=1&startTime={start}&endTime={end}&timeframe=day"
+)
 
 Interval = Literal["D", "W", "M"]
 
 
-def fetch_daily_ohlcv(stock_code: str, days: int = 540) -> pd.DataFrame:
-    """네이버 일별시세에서 (date, close, volume)을 최신순 DataFrame으로 반환.
-    days가 클수록 페이지를 더 많이 받아온다 (1페이지 ≒ 10거래일)."""
-    rows = []
-    pages_needed = (days // 10) + 3
+def fetch_daily_ohlcv(stock_code: str, years: int = 11) -> pd.DataFrame:
+    """네이버 JSON API에서 (date, close, volume) DataFrame을 최신순으로 반환.
+    years: 거슬러 받아올 연도 수 (월봉 10년치 표시 위해 기본 11년)."""
+    end = datetime.date.today()
+    start = end.replace(year=end.year - years)
+    url = SISE_JSON_URL.format(
+        code=stock_code,
+        start=start.strftime("%Y%m%d"),
+        end=end.strftime("%Y%m%d"),
+    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+    except Exception:
+        return pd.DataFrame()
 
-    for page in range(1, pages_needed + 1):
+    text = r.text.strip()
+    # API가 작은따옴표 + 줄바꿈 포함 JSON-like를 반환 → JSON 호환으로 변환
+    text = text.replace("'", '"')
+    text = re.sub(r"\s+", " ", text)
+    try:
+        rows = json.loads(text)
+    except json.JSONDecodeError:
+        return pd.DataFrame()
+
+    if not rows or len(rows) < 2:
+        return pd.DataFrame()
+
+    # 첫 행은 헤더: ["날짜","시가","고가","저가","종가","거래량","외국인소진율"]
+    header = rows[0]
+    data_rows = rows[1:]
+    if len(header) < 6:
+        return pd.DataFrame()
+
+    records = []
+    for row in data_rows:
+        if len(row) < 6:
+            continue
         try:
-            r = requests.get(
-                DAILY_URL.format(code=stock_code, page=page),
-                headers=HEADERS, timeout=10,
-            )
-            r.encoding = "euc-kr"
-        except Exception:
-            break
+            date = pd.to_datetime(str(row[0]), format="%Y%m%d")
+            close = int(row[4])
+            volume = int(row[5])
+        except (ValueError, IndexError, TypeError):
+            continue
+        records.append({"date": date, "close": close, "volume": volume})
 
-        soup = BeautifulSoup(r.text, "html.parser")
-        page_count = 0
-        for tr in soup.select("table.type2 tr"):
-            spans = tr.select("span.tah")
-            if len(spans) < 7:
-                continue
-            texts = [s.get_text(strip=True) for s in spans]
-            try:
-                date = pd.to_datetime(texts[0], format="%Y.%m.%d")
-                close = int(texts[1].replace(",", ""))
-                volume = int(texts[6].replace(",", ""))
-            except (ValueError, IndexError):
-                continue
-            rows.append({"date": date, "close": close, "volume": volume})
-            page_count += 1
-
-        # 페이지에 데이터가 없으면 종료
-        if page_count == 0:
-            break
-        if len(rows) >= days:
-            break
-
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(records)
     if df.empty:
         return df
     df = df.drop_duplicates(subset="date").sort_values("date", ascending=False).reset_index(drop=True)
-    return df.head(days)
+    return df
 
 
 def resample_ohlcv(daily_df: pd.DataFrame, interval: Interval) -> pd.DataFrame:
@@ -137,25 +150,27 @@ def support_resistance(closes: list[int], lookback: int = 60) -> tuple[int | Non
     return max(recent), min(recent)
 
 
-# 인터벌별 기본 표시 봉 수 / 지지·저항 룩백
+# 인터벌별 기본 표시 봉 수 / 지지·저항 룩백 — 네이버 증권 기본 차트와 유사
 DEFAULTS: dict[str, dict[str, int]] = {
-    "D": {"max_bars": 90,  "support_lookback": 60},   # 일봉: 90일, 60일 지지/저항
-    "W": {"max_bars": 52,  "support_lookback": 26},   # 주봉: 1년, 6개월
-    "M": {"max_bars": 24,  "support_lookback": 12},   # 월봉: 2년, 1년
+    "D": {"max_bars": 130, "support_lookback": 60},   # 일봉: ~6개월, 60일 지지/저항
+    "W": {"max_bars": 156, "support_lookback": 52},   # 주봉: ~3년, 1년 지지/저항
+    "M": {"max_bars": 120, "support_lookback": 60},   # 월봉: ~10년, 5년 지지/저항
 }
+
+# 인터벌별 데이터 수집 연도 (10년 월봉을 위해 충분히)
+FETCH_YEARS: dict[str, int] = {"D": 1, "W": 4, "M": 11}
 
 
 def analyze(stock_code: str, interval: Interval = "D",
-            max_bars: int | None = None, days: int = 540) -> dict[str, Any]:
-    """일봉/주봉/월봉 가격 시리즈 + RSI + OBV trend + 지지·저항을 한 번에 계산.
-
-    days: 일봉 데이터 수집 일수 (주/월봉 정확도 위해 충분히 받아옴).
-    """
+            max_bars: int | None = None, years: int | None = None) -> dict[str, Any]:
+    """일봉/주봉/월봉 가격 시리즈 + RSI + OBV trend + 지지·저항을 한 번에 계산."""
     cfg = DEFAULTS.get(interval, DEFAULTS["D"])
     if max_bars is None:
         max_bars = cfg["max_bars"]
+    if years is None:
+        years = FETCH_YEARS.get(interval, 11)
 
-    daily = fetch_daily_ohlcv(stock_code, days=days)
+    daily = fetch_daily_ohlcv(stock_code, years=years)
     out = {
         "interval": interval,
         "dates": [], "prices": [], "volumes": [],

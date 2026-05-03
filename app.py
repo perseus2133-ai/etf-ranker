@@ -264,7 +264,7 @@ def get_etf_detail(etf_code: str, top_n: int = 10) -> pd.DataFrame:
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_indicators(stock_code: str, interval: str = "D") -> dict:
     try:
-        return analyze(stock_code, interval=interval, days=540)
+        return analyze(stock_code, interval=interval)
     except Exception:
         return {"prices": [], "volumes": [], "rsi": None, "obv_trend": "",
                 "support": None, "resistance": None, "last_price": None,
@@ -620,8 +620,12 @@ def render_etf_detail(etf_code: str, etf_name: str):
     )
     interval_label = interval_label.split(" ", 1)[1]
     interval_code = {"일봉": "D", "주봉": "W", "월봉": "M"}[interval_label]
-    period_label = {"D": "최근 90일", "W": "최근 1년 (주봉)", "M": "최근 2년 (월봉)"}[interval_code]
-    sup_label = {"D": "60일", "W": "26주", "M": "12개월"}[interval_code]
+    period_label = {
+        "D": "최근 6개월 (일봉)",
+        "W": "최근 3년 (주봉)",
+        "M": "최근 10년 (월봉)",
+    }[interval_code]
+    sup_label = {"D": "60일", "W": "1년", "M": "5년"}[interval_code]
 
     # ── 차트 + 기술 지표 ─────────────────────────────────
     with st.spinner(f"{interval_label} 차트/지표 로딩 중..."):

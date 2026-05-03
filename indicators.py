@@ -1,16 +1,16 @@
 """
 종목/ETF 기술 지표 계산 모듈
-- 네이버 일간 시세를 받아 RSI(14), OBV trend, 60일 가격 차트 등을 계산.
+- 네이버 일별시세에서 (날짜, 종가, 거래량)을 받아온 뒤,
+  일봉/주봉/월봉으로 리샘플링하고 RSI(14) / OBV trend / 지지·저항 계산.
 """
 
 from __future__ import annotations
 
-import re
-from typing import Any
+from typing import Any, Literal
 
-import numpy as np
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
 
 HEADERS = {
     "User-Agent": (
@@ -21,67 +21,74 @@ HEADERS = {
 
 DAILY_URL = "https://finance.naver.com/item/sise_day.naver?code={code}&page={page}"
 
+Interval = Literal["D", "W", "M"]
 
-def fetch_daily_prices(stock_code: str, days: int = 90) -> tuple[list[int], list[int]]:
-    """네이버 일별 시세에서 (종가 리스트, 거래량 리스트)를 최신순으로 반환."""
-    prices, volumes = [], []
-    pages_needed = (days // 10) + 2
+
+def fetch_daily_ohlcv(stock_code: str, days: int = 540) -> pd.DataFrame:
+    """네이버 일별시세에서 (date, close, volume)을 최신순 DataFrame으로 반환.
+    days가 클수록 페이지를 더 많이 받아온다 (1페이지 ≒ 10거래일)."""
+    rows = []
+    pages_needed = (days // 10) + 3
+
     for page in range(1, pages_needed + 1):
         try:
             r = requests.get(
                 DAILY_URL.format(code=stock_code, page=page),
-                headers=HEADERS, timeout=10
+                headers=HEADERS, timeout=10,
             )
             r.encoding = "euc-kr"
-            html = r.text
         except Exception:
             break
 
-        # 테이블 행에서 종가/거래량 추출
-        # <td class="num"><span class="tah ...">CLOSE</span></td>
-        # 행마다 6개 td: 날짜, 종가, 전일비, 시가, 고가, 저가, 거래량
-        rows = re.findall(r"<tr[^>]*onmouseover[^>]*>(.*?)</tr>", html, re.DOTALL)
-        if not rows:
-            # 다른 셀렉터 시도: 날짜 행 패턴
-            rows = re.findall(
-                r'<td align="center"><span class="tah[^>]*>(\d{4}\.\d{2}\.\d{2})</span></td>'
-                r'.*?<td class="num"><span[^>]*>([\d,]+)</span></td>'
-                r'(?:.*?<td class="num">.*?</td>){4}'
-                r'.*?<td class="num"><span[^>]*>([\d,]+)</span></td>',
-                html, re.DOTALL
-            )
-            for _, close, vol in rows:
-                try:
-                    prices.append(int(close.replace(",", "")))
-                    volumes.append(int(vol.replace(",", "")))
-                except ValueError:
-                    continue
-            if len(prices) >= days:
-                break
-            continue
-
-        for row in rows:
-            nums = re.findall(r'<span class="tah[^>]*>([\d,\.]+)</span>', row)
-            if len(nums) < 6:
+        soup = BeautifulSoup(r.text, "html.parser")
+        page_count = 0
+        for tr in soup.select("table.type2 tr"):
+            spans = tr.select("span.tah")
+            if len(spans) < 7:
                 continue
+            texts = [s.get_text(strip=True) for s in spans]
             try:
-                close = int(nums[1].replace(",", ""))
-                vol = int(nums[5].replace(",", ""))
-                prices.append(close)
-                volumes.append(vol)
+                date = pd.to_datetime(texts[0], format="%Y.%m.%d")
+                close = int(texts[1].replace(",", ""))
+                volume = int(texts[6].replace(",", ""))
             except (ValueError, IndexError):
                 continue
-        if len(prices) >= days:
+            rows.append({"date": date, "close": close, "volume": volume})
+            page_count += 1
+
+        # 페이지에 데이터가 없으면 종료
+        if page_count == 0:
+            break
+        if len(rows) >= days:
             break
 
-    return prices[:days], volumes[:days]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.drop_duplicates(subset="date").sort_values("date", ascending=False).reset_index(drop=True)
+    return df.head(days)
 
 
-def calc_rsi(prices: list[int], period: int = 14) -> float | None:
-    """Wilder's RSI(14). prices는 최신순(현재→과거)."""
-    if len(prices) < period + 1:
+def resample_ohlcv(daily_df: pd.DataFrame, interval: Interval) -> pd.DataFrame:
+    """일봉을 주봉/월봉으로 리샘플링. 입력은 최신순, 출력도 최신순."""
+    if daily_df.empty or interval == "D":
+        return daily_df.copy()
+
+    # 시간순 정렬 후 리샘플
+    df = daily_df.sort_values("date").set_index("date")
+    rule = "W-FRI" if interval == "W" else "ME"
+    agg = df.resample(rule).agg({"close": "last", "volume": "sum"}).dropna(subset=["close"])
+    agg["volume"] = agg["volume"].astype(int)
+    agg["close"] = agg["close"].astype(int)
+    agg = agg.reset_index().sort_values("date", ascending=False).reset_index(drop=True)
+    return agg
+
+
+def calc_rsi(closes: list[int], period: int = 14) -> float | None:
+    """Wilder's RSI. closes는 최신순(현재→과거)."""
+    if len(closes) < period + 1:
         return None
-    p = list(reversed(prices))  # 과거→현재
+    p = list(reversed(closes))  # 과거→현재
     gains, losses = [], []
     for i in range(1, len(p)):
         d = p[i] - p[i - 1]
@@ -100,11 +107,11 @@ def calc_rsi(prices: list[int], period: int = 14) -> float | None:
     return round(100.0 - (100.0 / (1.0 + rs)), 1)
 
 
-def calc_obv_trend(prices: list[int], volumes: list[int]) -> str:
-    """OBV 누적 후 최근 10일 추세 (up/down/flat)."""
-    if len(prices) < 11:
+def calc_obv_trend(closes: list[int], volumes: list[int], lookback: int = 10) -> str:
+    """OBV 누적 후 최근 N봉 추세 (up/down/flat)."""
+    if len(closes) < lookback + 1:
         return ""
-    p = list(reversed(prices))
+    p = list(reversed(closes))
     v = list(reversed(volumes))
     obv = [0]
     for i in range(1, len(p)):
@@ -114,7 +121,7 @@ def calc_obv_trend(prices: list[int], volumes: list[int]) -> str:
             obv.append(obv[-1] - v[i])
         else:
             obv.append(obv[-1])
-    n = min(10, len(obv))
+    n = min(lookback, len(obv))
     diff = obv[-1] - obv[-n]
     if diff > 0:
         return "up"
@@ -123,31 +130,61 @@ def calc_obv_trend(prices: list[int], volumes: list[int]) -> str:
     return "flat"
 
 
-def support_resistance(prices: list[int], lookback: int = 60) -> tuple[int | None, int | None]:
-    if not prices:
+def support_resistance(closes: list[int], lookback: int = 60) -> tuple[int | None, int | None]:
+    if not closes:
         return None, None
-    recent = prices[:lookback]
+    recent = closes[:lookback]
     return max(recent), min(recent)
 
 
-def analyze(stock_code: str, days: int = 90) -> dict[str, Any]:
-    """한 번에 RSI/OBV/지지·저항/가격 시리즈를 모두 계산."""
-    prices, volumes = fetch_daily_prices(stock_code, days)
+# 인터벌별 기본 표시 봉 수 / 지지·저항 룩백
+DEFAULTS: dict[str, dict[str, int]] = {
+    "D": {"max_bars": 90,  "support_lookback": 60},   # 일봉: 90일, 60일 지지/저항
+    "W": {"max_bars": 52,  "support_lookback": 26},   # 주봉: 1년, 6개월
+    "M": {"max_bars": 24,  "support_lookback": 12},   # 월봉: 2년, 1년
+}
+
+
+def analyze(stock_code: str, interval: Interval = "D",
+            max_bars: int | None = None, days: int = 540) -> dict[str, Any]:
+    """일봉/주봉/월봉 가격 시리즈 + RSI + OBV trend + 지지·저항을 한 번에 계산.
+
+    days: 일봉 데이터 수집 일수 (주/월봉 정확도 위해 충분히 받아옴).
+    """
+    cfg = DEFAULTS.get(interval, DEFAULTS["D"])
+    if max_bars is None:
+        max_bars = cfg["max_bars"]
+
+    daily = fetch_daily_ohlcv(stock_code, days=days)
     out = {
-        "prices": prices,
-        "volumes": volumes,
-        "rsi": calc_rsi(prices),
-        "obv_trend": calc_obv_trend(prices, volumes),
+        "interval": interval,
+        "dates": [], "prices": [], "volumes": [],
+        "rsi": None, "obv_trend": "",
+        "support": None, "resistance": None,
+        "last_price": None, "bars_count": 0,
     }
-    res, sup = support_resistance(prices)
+    if daily.empty:
+        return out
+
+    bars = resample_ohlcv(daily, interval).head(max_bars)
+    closes = bars["close"].tolist()
+    vols = bars["volume"].tolist()
+    dates = bars["date"].tolist()
+
+    out["dates"] = dates
+    out["prices"] = closes
+    out["volumes"] = vols
+    out["bars_count"] = len(closes)
+    out["rsi"] = calc_rsi(closes)
+    out["obv_trend"] = calc_obv_trend(closes, vols)
+    res, sup = support_resistance(closes, lookback=min(cfg["support_lookback"], len(closes)))
     out["resistance"] = res
     out["support"] = sup
-    out["last_price"] = prices[0] if prices else None
+    out["last_price"] = closes[0] if closes else None
     return out
 
 
 def rsi_verdict(rsi: float | None) -> tuple[str, str]:
-    """RSI에 대한 한 줄 코멘트와 색."""
     if rsi is None:
         return "데이터 없음", "#94A3B8"
     if rsi >= 70:
@@ -173,8 +210,8 @@ def obv_verdict(trend: str) -> tuple[str, str]:
 if __name__ == "__main__":
     import sys
     code = sys.argv[1] if len(sys.argv) > 1 else "069500"
-    res = analyze(code)
-    print(f"Code: {code}")
-    print(f"Last price: {res['last_price']}, RSI: {res['rsi']}, OBV: {res['obv_trend']}")
-    print(f"Support: {res['support']}, Resistance: {res['resistance']}")
-    print(f"Prices fetched: {len(res['prices'])}")
+    for iv in ["D", "W", "M"]:
+        res = analyze(code, interval=iv)
+        print(f"\n[{iv}] bars={res['bars_count']}  last={res['last_price']:,}  "
+              f"RSI={res['rsi']}  OBV={res['obv_trend']}  "
+              f"S={res['support']:,}  R={res['resistance']:,}")

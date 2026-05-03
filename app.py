@@ -208,6 +208,36 @@ button[data-baseweb="tab"][aria-selected="true"] {
 button[data-baseweb="tab"] > div p { color: #A0AEC0 !important; font-weight: 700 !important; }
 button[data-baseweb="tab"][aria-selected="true"] > div p { color: #FFF !important; }
 
+/* 라디오 버튼 (차트 주기 선택) — 메인 영역에서 라벨 텍스트 가시성 확보 */
+[data-testid="stRadio"] label,
+[data-testid="stRadio"] label p,
+[data-testid="stRadio"] label > div,
+[data-testid="stRadio"] label > div > div,
+[data-testid="stRadio"] [data-baseweb="radio"] div {
+    color: #E2E8F0 !important;
+}
+[data-testid="stRadio"] [role="radiogroup"] label {
+    background: rgba(17,24,39,0.4);
+    border: 1px solid #4A5568;
+    border-radius: 8px;
+    padding: 6px 14px;
+    margin-right: 8px;
+    transition: all 0.2s ease;
+}
+[data-testid="stRadio"] [role="radiogroup"] label:hover {
+    border-color: #62EFFF;
+    background: rgba(98,239,255,0.08);
+}
+[data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) {
+    background: linear-gradient(135deg, #1D3557, #457B9D);
+    border-color: #62EFFF;
+    box-shadow: 0 0 12px rgba(98,239,255,0.25);
+}
+[data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) p {
+    color: #FFFFFF !important;
+    font-weight: 700;
+}
+
 #MainMenu { visibility: hidden; } footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
@@ -232,12 +262,13 @@ def get_etf_detail(etf_code: str, top_n: int = 10) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def get_indicators(stock_code: str) -> dict:
+def get_indicators(stock_code: str, interval: str = "D") -> dict:
     try:
-        return analyze(stock_code, days=90)
+        return analyze(stock_code, interval=interval, days=540)
     except Exception:
         return {"prices": [], "volumes": [], "rsi": None, "obv_trend": "",
-                "support": None, "resistance": None, "last_price": None}
+                "support": None, "resistance": None, "last_price": None,
+                "dates": [], "interval": interval, "bars_count": 0}
 
 
 # ============================================================
@@ -278,23 +309,33 @@ def naver_etf_url(code: str) -> str:
 # ============================================================
 # 차트 SVG (가격 + RSI 미니 차트)
 # ============================================================
-def build_price_chart_svg(prices: list[int], support: int | None, resistance: int | None,
-                          width: int = 600, height: int = 180) -> str:
-    """가격 차트 (최신순 입력 → 좌→우 시간순으로 표시)."""
+def build_price_chart_svg(
+    prices: list[int],
+    support: int | None,
+    resistance: int | None,
+    dates: list | None = None,
+    interval: str = "D",
+    width: int = 600,
+    height: int = 220,
+) -> str:
+    """가격 차트 (최신순 입력 → 좌→우 시간순으로 표시).
+    interval: 'D'/'W'/'M' — 차트 하단 단위 + x축 라벨 포맷에 사용.
+    """
     if not prices or len(prices) < 5:
-        return ('<div style="height:180px;display:flex;align-items:center;justify-content:center;'
+        return ('<div style="height:200px;display:flex;align-items:center;justify-content:center;'
                 'color:#94A3B8;font-family:JetBrains Mono;">차트 데이터 없음</div>')
 
     p = list(reversed(prices))  # 과거→현재
-    pad_l, pad_r, pad_t, pad_b = 50, 14, 14, 24
+    d_arr = list(reversed(dates)) if dates else []
+    pad_l, pad_r, pad_t, pad_b = 56, 16, 18, 30
     inner_w = width - pad_l - pad_r
     inner_h = height - pad_t - pad_b
 
     vmin = min(p + ([support] if support else []))
     vmax = max(p + ([resistance] if resistance else []))
     span = vmax - vmin if vmax != vmin else 1
-    pad = span * 0.08
-    vmin -= pad; vmax += pad
+    vpad = span * 0.08
+    vmin -= vpad; vmax += vpad
     span = vmax - vmin
 
     n = len(p)
@@ -303,56 +344,83 @@ def build_price_chart_svg(prices: list[int], support: int | None, resistance: in
 
     # 그리드 + 지지/저항 라인
     grid = ''
-    for frac in (0.0, 0.5, 1.0):
+    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
         gy = pad_t + inner_h * frac
         grid += (f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{width-pad_r}" y2="{gy:.1f}" '
-                 f'stroke="#4A5568" stroke-width="0.5" stroke-dasharray="2,3" opacity="0.5"/>')
+                 f'stroke="#4A5568" stroke-width="0.5" stroke-dasharray="2,3" opacity="0.4"/>')
     if resistance:
         ry = y_at(resistance)
         grid += (f'<line x1="{pad_l}" y1="{ry:.1f}" x2="{width-pad_r}" y2="{ry:.1f}" '
-                 f'stroke="#FB7185" stroke-width="1" stroke-dasharray="4,3" opacity="0.7"/>')
-        grid += (f'<text x="{width-pad_r}" y="{ry-3:.1f}" fill="#FB7185" font-size="9" '
-                 f'text-anchor="end" font-family="JetBrains Mono">저항 {resistance:,}</text>')
+                 f'stroke="#FB7185" stroke-width="1" stroke-dasharray="4,3" opacity="0.75"/>')
+        grid += (f'<text x="{width-pad_r-4}" y="{ry-3:.1f}" fill="#FB7185" font-size="10" '
+                 f'text-anchor="end" font-family="JetBrains Mono" font-weight="700">'
+                 f'저항 {resistance:,}</text>')
     if support:
         sy = y_at(support)
         grid += (f'<line x1="{pad_l}" y1="{sy:.1f}" x2="{width-pad_r}" y2="{sy:.1f}" '
-                 f'stroke="#34D399" stroke-width="1" stroke-dasharray="4,3" opacity="0.7"/>')
-        grid += (f'<text x="{width-pad_r}" y="{sy+11:.1f}" fill="#34D399" font-size="9" '
-                 f'text-anchor="end" font-family="JetBrains Mono">지지 {support:,}</text>')
+                 f'stroke="#34D399" stroke-width="1" stroke-dasharray="4,3" opacity="0.75"/>')
+        grid += (f'<text x="{width-pad_r-4}" y="{sy+12:.1f}" fill="#34D399" font-size="10" '
+                 f'text-anchor="end" font-family="JetBrains Mono" font-weight="700">'
+                 f'지지 {support:,}</text>')
 
     # 가격 라인 + 영역
     pts = [(x_at(i), y_at(v)) for i, v in enumerate(p)]
-    d = ' '.join(f'{"M" if i==0 else "L"} {x:.1f} {y:.1f}' for i, (x, y) in enumerate(pts))
-    fill_d = (d + f' L {pts[-1][0]:.1f} {pad_t+inner_h:.1f} '
+    line_d = ' '.join(f'{"M" if i==0 else "L"} {x:.1f} {y:.1f}' for i, (x, y) in enumerate(pts))
+    fill_d = (line_d + f' L {pts[-1][0]:.1f} {pad_t+inner_h:.1f} '
               f'L {pts[0][0]:.1f} {pad_t+inner_h:.1f} Z')
 
+    # 마지막 가격 마커
+    last_x, last_y = pts[-1]
+    marker = (
+        f'<circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="4" fill="#62EFFF" '
+        f'stroke="#1A1C24" stroke-width="2"/>'
+        f'<text x="{last_x-6:.1f}" y="{last_y-8:.1f}" fill="#62EFFF" font-size="11" '
+        f'text-anchor="end" font-family="JetBrains Mono" font-weight="800">'
+        f'{p[-1]:,}</text>'
+    )
+
     # Y축 라벨
-    y_labels = (
-        f'<text x="{pad_l-6}" y="{pad_t+4:.1f}" fill="#94A3B8" font-size="9" '
-        f'text-anchor="end" font-family="JetBrains Mono">{vmax:,.0f}</text>'
-        f'<text x="{pad_l-6}" y="{pad_t+inner_h+3:.1f}" fill="#94A3B8" font-size="9" '
-        f'text-anchor="end" font-family="JetBrains Mono">{vmin:,.0f}</text>'
-    )
-    # X축 라벨
-    x_labels = (
-        f'<text x="{pad_l}" y="{height-6}" fill="#94A3B8" font-size="9" '
-        f'text-anchor="start" font-family="JetBrains Mono">-{n}d</text>'
-        f'<text x="{width-pad_r}" y="{height-6}" fill="#94A3B8" font-size="9" '
-        f'text-anchor="end" font-family="JetBrains Mono">최근</text>'
-    )
+    y_labels = ''
+    for frac, val in [(0.0, vmax), (0.5, (vmax + vmin) / 2), (1.0, vmin)]:
+        gy = pad_t + inner_h * frac
+        y_labels += (
+            f'<text x="{pad_l-6}" y="{gy+3:.1f}" fill="#94A3B8" font-size="10" '
+            f'text-anchor="end" font-family="JetBrains Mono">{val:,.0f}</text>'
+        )
+
+    # X축 라벨 (날짜)
+    fmt_date = {"D": "%m/%d", "W": "%y/%m/%d", "M": "%Y/%m"}.get(interval, "%m/%d")
+    if d_arr:
+        # 균등 간격으로 4~5개 라벨
+        n_labels = 5 if n >= 20 else min(3, n)
+        idxs = [int(round(i * (n - 1) / max(1, n_labels - 1))) for i in range(n_labels)]
+        x_labels = ''.join(
+            f'<text x="{x_at(i):.1f}" y="{height - 10}" fill="#94A3B8" font-size="10" '
+            f'text-anchor="middle" font-family="JetBrains Mono">'
+            f'{pd.Timestamp(d_arr[i]).strftime(fmt_date)}</text>'
+            for i in idxs if i < len(d_arr)
+        )
+    else:
+        unit = {"D": "일", "W": "주", "M": "월"}.get(interval, "")
+        x_labels = (
+            f'<text x="{pad_l}" y="{height-10}" fill="#94A3B8" font-size="10" '
+            f'text-anchor="start" font-family="JetBrains Mono">-{n}{unit}</text>'
+            f'<text x="{width-pad_r}" y="{height-10}" fill="#94A3B8" font-size="10" '
+            f'text-anchor="end" font-family="JetBrains Mono">최근</text>'
+        )
 
     return (
         f'<svg width="100%" viewBox="0 0 {width} {height}" preserveAspectRatio="xMidYMid meet" '
         f'xmlns="http://www.w3.org/2000/svg">'
         f'<defs><linearGradient id="priceGrad" x1="0" y1="0" x2="0" y2="1">'
-        f'<stop offset="0%" stop-color="#62EFFF" stop-opacity="0.4"/>'
+        f'<stop offset="0%" stop-color="#62EFFF" stop-opacity="0.45"/>'
         f'<stop offset="100%" stop-color="#62EFFF" stop-opacity="0"/>'
         f'</linearGradient></defs>'
         f'{grid}'
         f'<path d="{fill_d}" fill="url(#priceGrad)"/>'
-        f'<path d="{d}" fill="none" stroke="#62EFFF" stroke-width="2" '
+        f'<path d="{line_d}" fill="none" stroke="#62EFFF" stroke-width="2.2" '
         f'stroke-linecap="round" stroke-linejoin="round"/>'
-        f'{y_labels}{x_labels}'
+        f'{marker}{y_labels}{x_labels}'
         f'</svg>'
     )
 
@@ -538,44 +606,63 @@ def render_etf_card(row, rank: int):
 
 
 def render_etf_detail(etf_code: str, etf_name: str):
-    """확장된 상세: 포트폴리오 TOP10 + 매출/영업이익 forecast + 차트 + RSI/OBV."""
+    """확장된 상세: 차트(일/주/월) + RSI/OBV + 포트폴리오 forecast."""
     detail = get_etf_detail(etf_code, top_n=10)
 
+    # ── 차트 주기 선택 ────────────────────────────────────
+    st.markdown(f"### 📈 {etf_name} · 가격 추이")
+    interval_label = st.radio(
+        "차트 주기",
+        options=["📅 일봉", "📆 주봉", "🗓 월봉"],
+        index=0,
+        horizontal=True,
+        key=f"interval_{etf_code}",
+    )
+    interval_label = interval_label.split(" ", 1)[1]
+    interval_code = {"일봉": "D", "주봉": "W", "월봉": "M"}[interval_label]
+    period_label = {"D": "최근 90일", "W": "최근 1년 (주봉)", "M": "최근 2년 (월봉)"}[interval_code]
+    sup_label = {"D": "60일", "W": "26주", "M": "12개월"}[interval_code]
+
     # ── 차트 + 기술 지표 ─────────────────────────────────
-    with st.spinner("차트/지표 로딩 중..."):
-        ind = get_indicators(etf_code)
+    with st.spinner(f"{interval_label} 차트/지표 로딩 중..."):
+        ind = get_indicators(etf_code, interval=interval_code)
 
     rsi_text, rsi_color = rsi_verdict(ind.get("rsi"))
     obv_text, obv_color = obv_verdict(ind.get("obv_trend", ""))
     last_price = ind.get("last_price")
     support = ind.get("support")
     resistance = ind.get("resistance")
+    bars = ind.get("bars_count", 0)
 
-    chart_svg = build_price_chart_svg(ind.get("prices", []), support, resistance)
+    chart_svg = build_price_chart_svg(
+        ind.get("prices", []),
+        support,
+        resistance,
+        dates=ind.get("dates", []),
+        interval=interval_code,
+    )
+
+    # 기술지표 박스
+    def tech_item(k, v, color="#FFF"):
+        return (f'<div class="item"><div class="k">{k}</div>'
+                f'<div class="v" style="color:{color};">{v}</div></div>')
+
+    last_price_str = f"{last_price:,}원" if last_price else "—"
+    res_str = f"{resistance:,}원" if resistance else "—"
+    sup_str = f"{support:,}원" if support else "—"
 
     tech_html = (
-        f'<div class="qc-tech">'
-        f'<div class="item"><div class="k">현재가</div>'
-        f'<div class="v" style="color:#62EFFF;">{last_price:,}원</div></div>' if last_price else
-        f'<div class="qc-tech"><div class="item"><div class="k">현재가</div><div class="v">—</div></div>'
+        '<div class="qc-tech">'
+        + tech_item("현재가", last_price_str, "#62EFFF")
+        + tech_item("RSI(14)", rsi_text, rsi_color)
+        + tech_item("OBV 추세", obv_text, obv_color)
+        + tech_item(f"{sup_label} 저항", res_str, "#FB7185")
+        + tech_item(f"{sup_label} 지지", sup_str, "#34D399")
+        + tech_item("표시 봉수", f"{bars}개", "#94A3B8")
+        + '</div>'
     )
-    tech_html += (
-        f'<div class="item"><div class="k">RSI(14)</div>'
-        f'<div class="v" style="color:{rsi_color};">{rsi_text}</div></div>'
-        f'<div class="item"><div class="k">OBV 추세</div>'
-        f'<div class="v" style="color:{obv_color};">{obv_text}</div></div>'
-        f'<div class="item"><div class="k">60일 저항</div>'
-        f'<div class="v" style="color:#FB7185;">{resistance:,}원</div></div>' if resistance else
-        f'<div class="item"><div class="k">60일 저항</div><div class="v">—</div></div>'
-    )
-    tech_html += (
-        f'<div class="item"><div class="k">60일 지지</div>'
-        f'<div class="v" style="color:#34D399;">{support:,}원</div></div>' if support else
-        f'<div class="item"><div class="k">60일 지지</div><div class="v">—</div></div>'
-    )
-    tech_html += '</div>'
 
-    st.markdown(f"### 📈 {etf_name} · 가격 추이 (90일)")
+    st.caption(f"📊 {period_label} · RSI(14) · 지지/저항: 최근 {sup_label}")
     st.markdown(
         f'<div style="background:rgba(17,24,39,0.45);border:1px solid #4A5568;'
         f'border-radius:12px;padding:16px;margin-bottom:8px;">{chart_svg}</div>',
